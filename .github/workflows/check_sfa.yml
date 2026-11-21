@@ -1,0 +1,153 @@
+name: Hlídač výzev SFA
+
+on:
+  schedule:
+    # Spouští se každý den v 07:00 UTC (08:00 SEČ / 09:00 SELČ)
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+    inputs:
+      test_notification:
+        description: "Odeslat testovací upozornění (vytvoří testovací GitHub Issue)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  check-sfa-calls:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Kontrola otevřených výzev na sfa.gov.cz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          TEST_NOTIFICATION: ${{ inputs.test_notification }}
+        run: |
+          python3 - << 'EOF'
+          import html, json, os, re, sys, urllib.request
+
+          TARGETS = [
+              {
+                  "label": "Kompletní vývoj dokumentárního díla (Kategorie B: Televizní díla)",
+                  "url": "https://sfa.gov.cz/vyzvy/2",
+                  "all_kw": ["vývoj", "dokument"],
+                  "any_kw": ["dokument"],
+              },
+              {
+                  "label": "Výroba krátkometrážního filmu (Kategorie A: Kinematografie)",
+                  "url": "https://sfa.gov.cz/vyzvy/1",
+                  "all_kw": ["výroba"],
+                  "any_kw": ["krátkometráž", "krátkého", "krátký"],
+              },
+          ]
+
+          CALL_RE = re.compile(r"\b(202[7-9]-[A-D](?:-\d+){2,4})\s+([^\n]{5,120})", re.I)
+
+          def fetch(url, headers=None):
+              h = {"User-Agent": "Mozilla/5.0 (SFA-Watcher/1.0)"}
+              if headers:
+                  h.update(headers)
+              req = urllib.request.Request(url, headers=h)
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  return r.read().decode("utf-8", errors="replace")
+
+          def html_to_lines(raw):
+              t = html.unescape(raw)
+              t = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", " ", t, flags=re.S | re.I)
+              t = re.sub(r"</?(?:div|p|li|ul|ol|h[1-6]|tr|td|th|br|section|article)\b[^>]*>", "\n", t, flags=re.I)
+              t = re.sub(r"<[^>]+>", " ", t)
+              t = re.sub(r"[ \t\r]+", " ", t)
+              return re.sub(r"\n+", "\n", re.sub(r" *\n *", "\n", t)).strip()
+
+          token = os.environ["GITHUB_TOKEN"]
+          repo = os.environ["GITHUB_REPOSITORY"]
+          actor = os.environ.get("GITHUB_ACTOR", "")
+          test_mode = os.environ.get("TEST_NOTIFICATION", "").lower() == "true"
+
+          gh_headers = {
+              "Authorization": f"Bearer {token}",
+              "Accept": "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
+          }
+
+          issues_raw = fetch(f"https://api.github.com/repos/{repo}/issues?state=all&per_page=100", gh_headers)
+          existing_issues = json.loads(issues_raw)
+          existing_text = " ".join(f"{i.get('title', '')} {i.get('body', '')}" for i in existing_issues)
+
+          new_calls = []
+          for t in TARGETS:
+              lines = html_to_lines(fetch(t["url"]))
+              for m in CALL_RE.finditer(lines):
+                  code, title = m.group(1).strip(), m.group(2).strip()
+                  if code in existing_text:
+                      continue
+                  tl = title.lower()
+                  if all(k in tl for k in t["all_kw"]) and any(k in tl for k in t["any_kw"]):
+                      snip = lines[m.start():m.start() + 600]
+                      dl = re.search(r"od\s+\d+\.\s*\d+\.\s*\d{4}\s+do\s+\d+\.\s*\d+\.\s*\d{4}", snip, re.I)
+                      new_calls.append({
+                          "code": code,
+                          "title": title,
+                          "deadline": dl.group(0) if dl else "viz detail na webu SFA",
+                          "url": t["url"],
+                          "cat": t["label"],
+                      })
+
+          if test_mode and not new_calls:
+              new_calls = [
+                  {
+                      "code": "TEST-2027-B-1",
+                      "title": "Kompletní vývoj dokumentárního díla (test hlídače)",
+                      "deadline": "prosinec 2026 – leden 2027",
+                      "url": "https://sfa.gov.cz/vyzvy/2",
+                      "cat": "Kategorie B: Televizní díla",
+                  },
+                  {
+                      "code": "TEST-2027-A-2",
+                      "title": "Výroba krátkometrážního filmu (test hlídače)",
+                      "deadline": "prosinec 2026 – leden 2027",
+                      "url": "https://sfa.gov.cz/vyzvy/1",
+                      "cat": "Kategorie A: Kinematografie",
+                  },
+              ]
+
+          if not new_calls:
+              print("Žádná nová sledovaná výzva pro rok 2027 zatím nebyla vyhlášena.")
+              sys.exit(0)
+
+          issue_title = (
+              "✅ [TEST] Hlídač výzev SFA je aktivní a připravený"
+              if test_mode
+              else "🎬 Otevřena nová výzva SFA: " + ", ".join(f"{c['code']} {c['title']}" for c in new_calls)
+          )
+          body = [
+              "Hlídač detekoval otevření sledované výzvy na webu **Státního fondu audiovize (SFA)**:",
+              "",
+          ]
+          for c in new_calls:
+              body.extend([
+                  f"### {c['code']} – {c['title']}",
+                  f"- **Kategorie:** {c['cat']}",
+                  f"- **Lhůta pro podání žádostí:** **{c['deadline']}**",
+                  f"- **Odkaz na výzvu a formuláře:** {c['url']}",
+                  "",
+              ])
+
+          payload = {"title": issue_title, "body": "\n".join(body)}
+          if actor:
+              payload["assignees"] = [actor]
+
+          req = urllib.request.Request(
+              f"https://api.github.com/repos/{repo}/issues",
+              data=json.dumps(payload).encode("utf-8"),
+              headers={**gh_headers, "Content-Type": "application/json"},
+              method="POST",
+          )
+          with urllib.request.urlopen(req, timeout=30) as r:
+              res = json.loads(r.read().decode("utf-8"))
+              print("Vytvořeno upozornění (GitHub Issue):", res.get("html_url"))
+          EOF
